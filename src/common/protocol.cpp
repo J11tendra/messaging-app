@@ -1,6 +1,8 @@
 #include "protocol.h"
+
 #include <cstring>
 #include <algorithm>
+#include <cerrno>
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -11,6 +13,8 @@
     #include <unistd.h>
     #include <netinet/in.h>
 #endif
+
+namespace chat {
 
 void Packet::set_sender(const std::string &name) {
     std::memset(sender, 0, MAX_USERNAME_LEN);
@@ -62,10 +66,16 @@ bool send_packet(int socket_fd, const Packet &pkt) {
 #ifdef _WIN32
         int bytes = send(socket_fd, buffer + total_sent, static_cast<int>(to_send - total_sent), 0);
 #else
-        ssize_t bytes = send(socket_fd, buffer + total_sent, to_send - total_sent, 0);
+        ssize_t bytes = send(socket_fd, buffer + total_sent, to_send - total_sent, MSG_NOSIGNAL);
 #endif
-        if (bytes <= 0) {
-            return false; // Connection closed or socket error
+        if (bytes < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (bytes == 0) {
+            return false;
         }
         total_sent += static_cast<size_t>(bytes);
     }
@@ -83,8 +93,14 @@ bool recv_packet(int socket_fd, Packet &pkt) {
 #else
         ssize_t bytes = recv(socket_fd, buffer + total_received, to_receive - total_received, 0);
 #endif
-        if (bytes <= 0) {
-            return false; // Disconnected or socket error
+        if (bytes < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (bytes == 0) {
+            return false; // Disconnected or EOF
         }
         total_received += static_cast<size_t>(bytes);
     }
@@ -102,10 +118,14 @@ bool recv_packet(int socket_fd, Packet &pkt) {
     return true;
 }
 
-Packet create_packet(uint16_t type, const std::string &sender, const std::string &recipient, const std::string &payload) {
+Packet create_packet(uint16_t type,
+                     const std::string &sender,
+                     const std::string &recipient,
+                     const std::string &payload,
+                     StatusCode status) {
     Packet pkt;
     pkt.type = type;
-    pkt.status = static_cast<uint16_t>(StatusCode::STATUS_OK);
+    pkt.status = static_cast<uint16_t>(status);
     pkt.set_sender(sender);
     pkt.set_recipient(recipient);
     pkt.set_payload(payload);
@@ -119,3 +139,5 @@ Packet create_error_packet(StatusCode code, const std::string &error_msg) {
     pkt.set_payload(error_msg);
     return pkt;
 }
+
+}  // namespace chat

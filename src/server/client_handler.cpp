@@ -1,388 +1,302 @@
-#include "client_handler.hpp"
+#include "client_handler.h"
 
-#include <cerrno>
-#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <cctype>
 
-#include "database.hpp"
-#include "protocol.hpp"
-#include "session_manager.hpp"
+#ifdef _WIN32
+    #include <winsock2.h>
+#else
+    #include <sys/socket.h>
+    #include <unistd.h>
+#endif
+
+#include "protocol.h"
+#include "db.h"
+#include "session_manager.h"
 
 namespace chat {
 
-namespace {
+static void close_socket(int fd) {
+    if (fd >= 0) {
+#ifdef _WIN32
+        closesocket(fd);
+#else
+        ::shutdown(fd, SHUT_RDWR);
+        ::close(fd);
+#endif
+    }
+}
 
-// Ensures all `len` bytes are transmitted over a blocking TCP socket.
-bool send_all(int fd, const void* buf, size_t len) {
-    const auto* ptr = static_cast<const uint8_t*>(buf);
-    size_t total_sent = 0;
-
-    while (total_sent < len) {
-        ssize_t n = ::send(fd, ptr + total_sent, len - total_sent, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
+static bool is_valid_username(const std::string &name) {
+    if (name.empty() || name.size() >= MAX_USERNAME_LEN) {
+        return false;
+    }
+    if (name == "server" || name == "all") {
+        return false;
+    }
+    for (char c : name) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-' && c != '.') {
             return false;
         }
-        if (n == 0) {
-            return false;
-        }
-        total_sent += static_cast<size_t>(n);
     }
     return true;
 }
 
-// Reads an exact `len`-byte frame from a TCP stream.
-// Returns:  1 on full read, 0 on clean EOF, -1 on error.
-int recv_exact(int fd, void* buf, size_t len) {
-    auto* ptr = static_cast<uint8_t*>(buf);
-    size_t total_recv = 0;
-
-    while (total_recv < len) {
-        ssize_t n = ::recv(fd, ptr + total_recv, len - total_recv, 0);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        if (n == 0) {
-            return (total_recv == 0) ? 0 : -1;
-        }
-        total_recv += static_cast<size_t>(n);
-    }
-    return 1;
-}
-
-bool send_packet(int fd, const Packet& pkt) {
-    return send_all(fd, &pkt, PACKET_SIZE_BYTES);
-}
-
-void cleanup_session(int client_fd, SessionManager* sessions, std::string& authenticated_user) {
-    if (!authenticated_user.empty()) {
-        if (sessions != nullptr) {
-            sessions->remove_by_username(authenticated_user);
-        }
-        authenticated_user.clear();
-    } else if (sessions != nullptr && client_fd >= 0) {
-        sessions->remove_by_fd(client_fd);
-    }
-
-    if (client_fd >= 0) {
-        ::shutdown(client_fd, SHUT_RDWR);
-        ::close(client_fd);
-    }
-}
-
-}  // namespace
-
 void handle_client(ClientHandlerContext ctx) {
     const int client_fd = ctx.client_fd;
-    SessionManager* sessions = ctx.sessions;
-    Database* db = ctx.db;
-    std::atomic<bool>* running = ctx.running;
+    SessionManager *sessions = ctx.sessions;
+    std::atomic<bool> *running = ctx.running;
 
-    std::string authenticated_user;
+    std::string username;
+    Packet req;
 
-    while (running == nullptr || running->load()) {
-        Packet req{};
-        int rc = recv_exact(client_fd, &req, PACKET_SIZE_BYTES);
-        if (rc == 0) {
-            // Client closed connection
-            break;
+    // 1. Connection Handshake: The first packet MUST be CMD_CONNECT
+    if (!recv_packet(client_fd, req)) {
+        close_socket(client_fd);
+        return;
+    }
+
+    if (req.type != static_cast<uint16_t>(CommandType::CMD_CONNECT)) {
+        Packet err = create_error_packet(StatusCode::ERR_INVALID_USER, "Expected connect command.");
+        send_packet(client_fd, err);
+        close_socket(client_fd);
+        return;
+    }
+
+    username = req.get_sender();
+    if (username.empty()) {
+        username = req.get_payload();
+    }
+
+    // Validate username syntax and character constraints
+    if (!is_valid_username(username)) {
+        std::cout << "[server] Connection rejected: invalid username format '" << username << "'\n";
+        Packet err = create_error_packet(StatusCode::ERR_INVALID_USER,
+                                         "Invalid username: must be 1-31 alphanumeric characters.");
+        send_packet(client_fd, err);
+        close_socket(client_fd);
+        return;
+    }
+
+    // Authenticate and register new clients per project specification:
+    // "The server authenticates and registers each new client with the provided username."
+    if (!db_is_valid_user(username)) {
+        if (!db_add_user(username)) {
+            std::cout << "[server] Failed to register user '" << username << "' in database\n";
+            Packet err = create_error_packet(StatusCode::ERR_DATABASE_FAILURE,
+                                             "Failed to register user in database.");
+            send_packet(client_fd, err);
+            close_socket(client_fd);
+            return;
         }
-        if (rc < 0) {
-            if (running != nullptr && !running->load()) {
-                break;
-            }
-            std::cerr << "[worker] recv error on fd " << client_fd
-                      << ": " << std::strerror(errno) << "\n";
-            break;
-        }
+        std::cout << "[server] Registered new client '" << username << "' in user directory.\n";
+    }
 
-        const CommandType cmd = get_command(req);
-        const std::string sender_field = get_sender_str(req);
-        const std::string recipient_field = get_recipient_str(req);
-        const std::string payload_str = get_payload_str(req);
+    // Check for duplicate active session
+    if (sessions && sessions->is_online(username)) {
+        std::cout << "[server] Connection rejected: user '" << username << "' is already logged in\n";
+        Packet err = create_error_packet(StatusCode::ERR_USER_ALREADY_CONNECTED,
+                                         "User '" + username + "' is already connected from another session.");
+        send_packet(client_fd, err);
+        close_socket(client_fd);
+        return;
+    }
 
-        if (cmd == CommandType::CONNECT) {
-            const std::string target_user = !sender_field.empty() ? sender_field : payload_str;
-            if (target_user.empty() || target_user.size() >= MAX_USERNAME_LEN) {
-                Packet resp = make_packet(CommandType::CONNECT,
-                                          StatusCode::ERR_INVALID_USER,
-                                          "server",
-                                          target_user,
-                                          "Invalid username.");
-                send_packet(client_fd, resp);
-                continue;
-            }
+    // Register active session
+    if (!sessions || !sessions->add_session(username, client_fd)) {
+        Packet err = create_error_packet(StatusCode::ERR_GENERAL, "Failed to register session.");
+        send_packet(client_fd, err);
+        close_socket(client_fd);
+        return;
+    }
 
-            if (sessions != nullptr && sessions->is_online(target_user)) {
-                Packet resp = make_packet(CommandType::CONNECT,
-                                          StatusCode::ERR_DUPLICATE_LOGIN,
-                                          "server",
-                                          target_user,
-                                          "User is already logged in.");
-                send_packet(client_fd, resp);
-                continue;
-            }
+    std::cout << "[server] User '" << username << "' connected successfully (socket fd=" << client_fd << ")\n";
 
-            std::string db_err;
-            if (db != nullptr && !db->authenticate_or_register_user(target_user, &db_err)) {
-                Packet resp = make_packet(CommandType::CONNECT,
-                                          StatusCode::ERR_DB_ERROR,
-                                          "server",
-                                          target_user,
-                                          "Authentication failed: " + db_err);
-                send_packet(client_fd, resp);
-                continue;
-            }
+    // Send successful connection acknowledgement
+    Packet ack = create_packet(static_cast<uint16_t>(ResponseType::RESP_SUCCESS),
+                               "server",
+                               username,
+                               "Connected successfully as " + username + ".");
+    if (!send_packet(client_fd, ack)) {
+        goto cleanup;
+    }
 
-            if (sessions == nullptr || !sessions->add_session(target_user, client_fd)) {
-                Packet resp = make_packet(CommandType::CONNECT,
-                                          StatusCode::ERR_DUPLICATE_LOGIN,
-                                          "server",
-                                          target_user,
-                                          "Could not register active session (duplicate login).");
-                send_packet(client_fd, resp);
-                continue;
-            }
-
-            authenticated_user = target_user;
-            Packet ack = make_packet(CommandType::CONNECT,
-                                     StatusCode::OK,
-                                     "server",
-                                     authenticated_user,
-                                     "Connected as " + authenticated_user);
-            if (!send_packet(client_fd, ack)) {
-                break;
-            }
-
-            // Replay any queued offline messages (is_read == 0)
-            if (db != nullptr) {
-                std::vector<StoredMessage> unread =
-                    db->fetch_and_mark_unread(authenticated_user, &db_err);
-                for (const auto& msg : unread) {
-                    std::string formatted = "[" + msg.timestamp + "] " + msg.sender + ": " + msg.body;
-                    Packet offline_pkt = make_packet(CommandType::SEND_MESSAGE,
-                                                     StatusCode::OK,
-                                                     msg.sender,
-                                                     authenticated_user,
-                                                     formatted);
-                    if (!send_packet(client_fd, offline_pkt)) {
-                        goto done;
-                    }
+    // Check for and deliver any offline queued messages (is_read = 0)
+    {
+        std::vector<Packet> unread = db_get_unread_messages(username);
+        if (!unread.empty()) {
+            std::cout << "[server] Delivering " << unread.size() << " queued offline messages to '" << username << "'\n";
+            for (const auto &un_pkt : unread) {
+                if (!send_packet(client_fd, un_pkt)) {
+                    goto cleanup;
                 }
             }
-            continue;
+        }
+    }
+
+    // 2. Command Processing Loop
+    while (running && running->load()) {
+        if (!recv_packet(client_fd, req)) {
+            // Client closed connection or network error
+            break;
         }
 
-        // Require authentication before processing any other command
-        if (authenticated_user.empty()) {
-            Packet resp = make_packet(cmd,
-                                      StatusCode::ERR_BAD_REQUEST,
-                                      "server",
-                                      "",
-                                      "Must connect with a username first.");
-            send_packet(client_fd, resp);
-            continue;
-        }
+        const auto cmd = static_cast<CommandType>(req.type);
 
         switch (cmd) {
-            case CommandType::SEND_MESSAGE: {
-                if (recipient_field.empty() || payload_str.empty()) {
-                    Packet resp = make_packet(CommandType::SEND_MESSAGE,
-                                              StatusCode::ERR_BAD_REQUEST,
-                                              "server",
-                                              authenticated_user,
-                                              "Recipient and message body are required.");
-                    send_packet(client_fd, resp);
+            case CommandType::CMD_SEND_MSG: {
+                std::string target = req.get_recipient();
+                std::string text = req.get_payload();
+
+                if (target.empty() || text.empty()) {
+                    Packet err = create_error_packet(StatusCode::ERR_GENERAL,
+                                                     "Recipient and message text are required.");
+                    send_packet(client_fd, err);
                     break;
                 }
 
-                bool recipient_online = false;
-                int recipient_fd = -1;
-                if (sessions != nullptr) {
-                    auto fd_opt = sessions->get_fd(recipient_field);
-                    if (fd_opt.has_value()) {
-                        recipient_online = true;
-                        recipient_fd = *fd_opt;
-                    }
-                }
-
-                std::string db_err;
-                bool stored = (db == nullptr) || db->store_message(authenticated_user,
-                                                                    recipient_field,
-                                                                    payload_str,
-                                                                    recipient_online,
-                                                                    &db_err);
-                if (!stored) {
-                    Packet resp = make_packet(CommandType::SEND_MESSAGE,
-                                              StatusCode::ERR_DB_ERROR,
-                                              "server",
-                                              authenticated_user,
-                                              "Failed to persist message: " + db_err);
-                    send_packet(client_fd, resp);
+                // Check if target user exists in database
+                if (!db_is_valid_user(target)) {
+                    Packet err = create_error_packet(StatusCode::ERR_INVALID_USER,
+                                                     "User '" + target + "' does not exist.");
+                    send_packet(client_fd, err);
                     break;
                 }
 
-                if (recipient_online && recipient_fd >= 0) {
-                    Packet forward_pkt = make_packet(CommandType::SEND_MESSAGE,
-                                                     StatusCode::OK,
-                                                     authenticated_user,
-                                                     recipient_field,
-                                                     payload_str);
-                    send_packet(recipient_fd, forward_pkt);
+                // Check if target user is currently online
+                int target_fd = sessions ? sessions->get_socket(target) : -1;
+                if (target_fd >= 0) {
+                    // Online: persist as read (delivered in real time)
+                    db_save_message(username, target, text, true);
 
-                    Packet ack = make_packet(CommandType::SEND_MESSAGE,
-                                             StatusCode::OK,
-                                             "server",
-                                             authenticated_user,
-                                             "Delivered to " + recipient_field);
-                    send_packet(client_fd, ack);
+                    // Deliver real-time message to target socket
+                    Packet fwd = create_packet(static_cast<uint16_t>(ResponseType::MSG_REALTIME),
+                                               username,
+                                               target,
+                                               text);
+                    send_packet(target_fd, fwd);
+
+                    // Acknowledge to sender
+                    Packet res = create_packet(static_cast<uint16_t>(ResponseType::RESP_SUCCESS),
+                                               "server",
+                                               username,
+                                               "Message delivered to " + target + ".");
+                    send_packet(client_fd, res);
                 } else {
-                    Packet ack = make_packet(CommandType::SEND_MESSAGE,
-                                             StatusCode::OK,
-                                             "server",
-                                             authenticated_user,
-                                             "Queued offline for " + recipient_field);
-                    send_packet(client_fd, ack);
+                    // Offline: persist as unread (queued in database for next login)
+                    db_save_message(username, target, text, false);
+
+                    Packet res = create_packet(static_cast<uint16_t>(ResponseType::RESP_SUCCESS),
+                                               "server",
+                                               username,
+                                               "User '" + target + "' is offline. Message queued for delivery at next login.");
+                    send_packet(client_fd, res);
                 }
                 break;
             }
 
-            case CommandType::GET_MESSAGES: {
-                if (recipient_field.empty()) {
-                    Packet resp = make_packet(CommandType::GET_MESSAGES,
-                                              StatusCode::ERR_BAD_REQUEST,
-                                              "server",
-                                              authenticated_user,
-                                              "Target user is required for getmessages.");
-                    send_packet(client_fd, resp);
+            case CommandType::CMD_GET_MSGS: {
+                std::string target = req.get_recipient();
+                if (target.empty()) {
+                    Packet err = create_error_packet(StatusCode::ERR_GENERAL,
+                                                     "Target user is required for getmessages.");
+                    send_packet(client_fd, err);
                     break;
                 }
 
-                std::string db_err;
-                std::vector<StoredMessage> history =
-                    (db != nullptr)
-                        ? db->get_conversation_history(authenticated_user, recipient_field, &db_err)
-                        : std::vector<StoredMessage>{};
-
-                if (!db_err.empty()) {
-                    Packet resp = make_packet(CommandType::GET_MESSAGES,
-                                              StatusCode::ERR_DB_ERROR,
-                                              "server",
-                                              authenticated_user,
-                                              "Failed to fetch history: " + db_err);
-                    send_packet(client_fd, resp);
+                if (!db_is_valid_user(target)) {
+                    Packet err = create_error_packet(StatusCode::ERR_INVALID_USER,
+                                                     "User '" + target + "' does not exist.");
+                    send_packet(client_fd, err);
                     break;
                 }
 
-                std::ostringstream oss;
-                if (history.empty()) {
-                    oss << "No messages exchanged with " << recipient_field << ".";
+                std::string conversation = db_get_conversation(username, target);
+                Packet res = create_packet(static_cast<uint16_t>(ResponseType::RESP_HISTORY),
+                                           "server",
+                                           username,
+                                           conversation);
+                send_packet(client_fd, res);
+                break;
+            }
+
+            case CommandType::CMD_DEL_MSGS: {
+                std::string target = req.get_recipient();
+                if (target.empty()) {
+                    Packet err = create_error_packet(StatusCode::ERR_GENERAL,
+                                                     "Target user is required for deletemessages.");
+                    send_packet(client_fd, err);
+                    break;
+                }
+
+                if (!db_is_valid_user(target)) {
+                    Packet err = create_error_packet(StatusCode::ERR_INVALID_USER,
+                                                     "User '" + target + "' does not exist.");
+                    send_packet(client_fd, err);
+                    break;
+                }
+
+                if (db_delete_conversation(username, target)) {
+                    Packet res = create_packet(static_cast<uint16_t>(ResponseType::RESP_SUCCESS),
+                                               "server",
+                                               username,
+                                               "All messages exchanged with '" + target + "' deleted successfully.");
+                    send_packet(client_fd, res);
                 } else {
-                    for (const auto& m : history) {
-                        oss << "[" << m.timestamp << "] " << m.sender
-                            << " -> " << m.recipient << ": " << m.body << "\n";
-                    }
+                    Packet err = create_error_packet(StatusCode::ERR_DATABASE_FAILURE,
+                                                     "Failed to delete messages with '" + target + "'.");
+                    send_packet(client_fd, err);
                 }
-
-                Packet resp = make_packet(CommandType::GET_MESSAGES,
-                                          StatusCode::OK,
-                                          "server",
-                                          authenticated_user,
-                                          oss.str());
-                send_packet(client_fd, resp);
                 break;
             }
 
-            case CommandType::DELETE_MESSAGES: {
-                if (recipient_field.empty()) {
-                    Packet resp = make_packet(CommandType::DELETE_MESSAGES,
-                                              StatusCode::ERR_BAD_REQUEST,
-                                              "server",
-                                              authenticated_user,
-                                              "Target user is required for deletemessages.");
-                    send_packet(client_fd, resp);
-                    break;
-                }
-
-                std::string db_err;
-                bool ok = (db == nullptr) ||
-                          db->delete_conversation_history(authenticated_user, recipient_field, &db_err);
-                if (!ok) {
-                    Packet resp = make_packet(CommandType::DELETE_MESSAGES,
-                                              StatusCode::ERR_DB_ERROR,
-                                              "server",
-                                              authenticated_user,
-                                              "Failed to delete messages: " + db_err);
-                    send_packet(client_fd, resp);
-                    break;
-                }
-
-                Packet resp = make_packet(CommandType::DELETE_MESSAGES,
-                                          StatusCode::OK,
-                                          "server",
-                                          authenticated_user,
-                                          "Deleted message history with " + recipient_field);
-                send_packet(client_fd, resp);
-                break;
-            }
-
-            case CommandType::GET_USER_LIST: {
+            case CommandType::CMD_GET_USERLIST: {
                 std::ostringstream oss;
-                if (sessions != nullptr) {
+                if (sessions) {
                     std::vector<std::string> users = sessions->get_online_users();
+                    oss << "Online users (" << users.size() << "): ";
                     for (size_t i = 0; i < users.size(); ++i) {
-                        if (i > 0) {
-                            oss << ", ";
-                        }
+                        if (i > 0) oss << ", ";
                         oss << users[i];
                     }
                 }
-
-                Packet resp = make_packet(CommandType::GET_USER_LIST,
-                                          StatusCode::OK,
-                                          "server",
-                                          authenticated_user,
-                                          oss.str());
-                send_packet(client_fd, resp);
+                Packet res = create_packet(static_cast<uint16_t>(ResponseType::RESP_USERLIST),
+                                           "server",
+                                           username,
+                                           oss.str());
+                send_packet(client_fd, res);
                 break;
             }
 
-            case CommandType::SHUTDOWN: {
-                Packet ack = make_packet(CommandType::SHUTDOWN,
-                                         StatusCode::OK,
-                                         "server",
-                                         authenticated_user,
-                                         "Disconnected.");
-                send_packet(client_fd, ack);
-                goto done;
+            case CommandType::CMD_SHUTDOWN_CLIENT: {
+                Packet res = create_packet(static_cast<uint16_t>(ResponseType::RESP_SUCCESS),
+                                           "server",
+                                           username,
+                                           "Disconnected gracefully.");
+                send_packet(client_fd, res);
+                goto cleanup;
             }
 
-            case CommandType::CONNECT:
-            case CommandType::SERVER_NOTICE:
+            case CommandType::CMD_CONNECT:
             default: {
-                Packet resp = make_packet(cmd,
-                                          StatusCode::ERR_BAD_REQUEST,
-                                          "server",
-                                          authenticated_user,
-                                          "Unsupported command.");
-                send_packet(client_fd, resp);
+                Packet err = create_error_packet(StatusCode::ERR_GENERAL, "Unknown or unexpected command.");
+                send_packet(client_fd, err);
                 break;
             }
         }
     }
 
-done:
-    cleanup_session(client_fd, sessions, authenticated_user);
+cleanup:
+    if (!username.empty() && sessions) {
+        sessions->remove_by_username(username);
+        std::cout << "[server] User '" << username << "' disconnected.\n";
+    } else if (sessions) {
+        sessions->remove_by_fd(client_fd);
+    }
+    close_socket(client_fd);
 }
 
 }  // namespace chat

@@ -1,20 +1,20 @@
-#include "session_manager.hpp"
+#include "session_manager.h"
 
 namespace chat {
 
-bool SessionManager::add_session(const std::string& username, int client_fd) {
+bool SessionManager::add_session(const std::string &username, int client_fd) {
     if (username.empty() || client_fd < 0) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(session_mtx_);
+    std::lock_guard<std::mutex> lock(mtx_);
 
     // Prevent duplicate logins for already-active users
     if (user_to_fd_.find(username) != user_to_fd_.end()) {
         return false;
     }
 
-    // Ensure a reused fd does not leave a stale entry
+    // Clean up any stale mapping associated with this fd
     auto stale_it = fd_to_user_.find(client_fd);
     if (stale_it != fd_to_user_.end()) {
         user_to_fd_.erase(stale_it->second);
@@ -26,26 +26,22 @@ bool SessionManager::add_session(const std::string& username, int client_fd) {
     return true;
 }
 
-std::optional<int> SessionManager::remove_by_username(const std::string& username) {
-    std::lock_guard<std::mutex> lock(session_mtx_);
+void SessionManager::remove_by_username(const std::string &username) {
+    std::lock_guard<std::mutex> lock(mtx_);
 
     auto it = user_to_fd_.find(username);
-    if (it == user_to_fd_.end()) {
-        return std::nullopt;
+    if (it != user_to_fd_.end()) {
+        fd_to_user_.erase(it->second);
+        user_to_fd_.erase(it);
     }
-
-    int fd = it->second;
-    fd_to_user_.erase(fd);
-    user_to_fd_.erase(it);
-    return fd;
 }
 
-std::optional<std::string> SessionManager::remove_by_fd(int client_fd) {
-    std::lock_guard<std::mutex> lock(session_mtx_);
+std::string SessionManager::remove_by_fd(int client_fd) {
+    std::lock_guard<std::mutex> lock(mtx_);
 
     auto it = fd_to_user_.find(client_fd);
     if (it == fd_to_user_.end()) {
-        return std::nullopt;
+        return "";
     }
 
     std::string username = it->second;
@@ -54,45 +50,42 @@ std::optional<std::string> SessionManager::remove_by_fd(int client_fd) {
     return username;
 }
 
-std::optional<int> SessionManager::get_fd(const std::string& username) const {
-    std::lock_guard<std::mutex> lock(session_mtx_);
+int SessionManager::get_socket(const std::string &username) const {
+    std::lock_guard<std::mutex> lock(mtx_);
 
     auto it = user_to_fd_.find(username);
-    if (it == user_to_fd_.end()) {
-        return std::nullopt;
-    }
-    return it->second;
+    return (it != user_to_fd_.end()) ? it->second : -1;
 }
 
-bool SessionManager::is_online(const std::string& username) const {
-    std::lock_guard<std::mutex> lock(session_mtx_);
+bool SessionManager::is_online(const std::string &username) const {
+    std::lock_guard<std::mutex> lock(mtx_);
     return user_to_fd_.find(username) != user_to_fd_.end();
 }
 
 std::vector<std::string> SessionManager::get_online_users() const {
-    std::lock_guard<std::mutex> lock(session_mtx_);
+    std::lock_guard<std::mutex> lock(mtx_);
 
     std::vector<std::string> users;
     users.reserve(user_to_fd_.size());
-    for (const auto& entry : user_to_fd_) {
-        users.push_back(entry.first);
+    for (const auto &pair : user_to_fd_) {
+        users.push_back(pair.first);
     }
     return users;
 }
 
 std::vector<std::pair<std::string, int>> SessionManager::get_all_sessions() const {
-    std::lock_guard<std::mutex> lock(session_mtx_);
+    std::lock_guard<std::mutex> lock(mtx_);
 
     std::vector<std::pair<std::string, int>> sessions;
     sessions.reserve(user_to_fd_.size());
-    for (const auto& entry : user_to_fd_) {
-        sessions.emplace_back(entry.first, entry.second);
+    for (const auto &pair : user_to_fd_) {
+        sessions.emplace_back(pair.first, pair.second);
     }
     return sessions;
 }
 
 size_t SessionManager::active_count() const {
-    std::lock_guard<std::mutex> lock(session_mtx_);
+    std::lock_guard<std::mutex> lock(mtx_);
     return user_to_fd_.size();
 }
 

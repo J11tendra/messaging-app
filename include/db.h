@@ -5,17 +5,19 @@
 #include <vector>
 #include "protocol.h"
 
-// Lifecycle
-bool db_init(const std::string &db_path = "server.db");
+namespace chat {
+
+// Database Lifecycle
+bool db_init(const std::string &db_path = "data/server.db");
 void db_close();
 
-// User Authorization
+// User Authorization (Checks pre-seeded or registered users)
 bool db_is_valid_user(const std::string &username);
 bool db_add_user(const std::string &username, const std::string &password = "password123");
 
 // Message Storage & Routing
 // is_read = true if recipient is currently online (real-time delivered)
-// is_read = false if recipient is offline (queued)
+// is_read = false if recipient is offline (queued for next login)
 bool db_save_message(const std::string &sender, const std::string &recipient, const std::string &content, bool is_read);
 
 // Offline Queue Delivery
@@ -28,5 +30,7 @@ std::string db_get_conversation(const std::string &user1, const std::string &use
 
 // Permanently deletes all messages between user1 and user2
 bool db_delete_conversation(const std::string &user1, const std::string &user2);
+
+}  // namespace chat
 
 #endif // DB_H
