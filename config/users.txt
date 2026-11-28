@@ -1,0 +1,9 @@
+# List of valid users who may log in to the server.
+# One user name per line (1-31 characters: letters, digits, _ . -).
+# Names are case-sensitive. Lines starting with '#' are comments.
+# Edit this file and restart the server to change who can log in.
+Rouchelle
+Tanvi
+Jitendra
+Akshay
+Prof.
